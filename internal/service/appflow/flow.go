@@ -2,6 +2,7 @@ package appflow
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"regexp"
 	"time"
@@ -12,7 +13,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/structure"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 	"github.com/hashicorp/terraform-provider-aws/internal/conns"
 	"github.com/hashicorp/terraform-provider-aws/internal/flex"
@@ -1213,14 +1213,8 @@ func resourceFlowCreate(ctx context.Context, d *schema.ResourceData, meta interf
 		return diag.Errorf("creating Appflow Flow (%s): empty output", d.Get("name").(string))
 	}
 
-	d.SetId(aws.ToString(out.Flow.FlowArn))
+	d.SetId(aws.ToString(out.Flow.FlowName))
 
-	// TIP: 5. Use a waiter to wait for create to complete
-	if _, err := waitFlowCreated(ctx, conn, d.Id(), d.Timeout(schema.TimeoutCreate)); err != nil {
-		return diag.Errorf("waiting for Appflow Flow (%s) create: %s", d.Id(), err)
-	}
-
-	// TIP: 6. Call the Read function in the Create return
 	return resourceFlowRead(ctx, d, meta)
 }
 
@@ -1235,14 +1229,10 @@ func resourceFlowRead(ctx context.Context, d *schema.ResourceData, meta interfac
 	// 5. Set the tags
 	// 6. Return nil
 
-	// TIP: 1. Get a client connection to the relevant service
 	conn := meta.(*conns.AWSClient).AppFlowConn
 
-	// TIP: 2. Get the resource from AWS using an API Get, List, or Describe-
-	// type function, or, better yet, using a finder.
-	out, err := findFlowByID(ctx, conn, d.Id())
+	out, err := conn.DescribeFlowWithContext(ctx, conn, d.Id())
 
-	// TIP: 3. Set ID to empty where resource is not new and not found
 	if !d.IsNewResource() && tfresource.NotFound(err) {
 		log.Printf("[WARN] AppFlow Flow (%s) not found, removing from state", d.Id())
 		d.SetId("")
@@ -1253,45 +1243,34 @@ func resourceFlowRead(ctx context.Context, d *schema.ResourceData, meta interfac
 		return diag.Errorf("reading AppFlow Flow (%s): %s", d.Id(), err)
 	}
 
-	// TIP: 4. Set the arguments and attributes
-	//
-	// For simple data types (i.e., schema.TypeString, schema.TypeBool,
-	// schema.TypeInt, and schema.TypeFloat), a simple Set call (e.g.,
-	// d.Set("arn", out.Arn) is sufficient. No error or nil checking is
-	// necessary.
-	//
-	// However, there are some situations where more handling is needed.
-	// a. Complex data types (e.g., schema.TypeList, schema.TypeSet)
-	// b. Where errorneous diffs occur. For example, a schema.TypeString may be
-	//    a JSON. AWS may return the JSON in a slightly different order but it
-	//    is equivalent to what is already set. In that case, you may check if
-	//    it is equivalent before setting the different JSON.
-	d.Set("arn", out.Arn)
-	d.Set("name", out.Name)
+	d.Set("arn", out.FlowArn)
+	d.Set("description", out.Description)
 
-	// TIP: Setting a complex type.
-	// For more information, see:
-	// https://github.com/hashicorp/terraform-provider-aws/blob/main/docs/contributing/data-handling-and-conversion.md
-	// https://github.com/hashicorp/terraform-provider-aws/blob/main/docs/contributing/data-handling-and-conversion.md#flatten-functions-for-blocks
-	// https://github.com/hashicorp/terraform-provider-aws/blob/main/docs/contributing/data-handling-and-conversion.md#root-typeset-of-resource-and-aws-list-of-structure
-	if err := d.Set("complex_argument", flattenComplexArguments(out.ComplexArguments)); err != nil {
-		return diag.Errorf("setting complex argument: %s", err)
+	if err := d.Set("destination_flow_config", flattenDestinationFlowConfigs(out.DestinationFlowConfigList)); err != nil {
+		return fmt.Errorf("error setting destination_flow_config: %w", err)
 	}
 
-	// TIP: Setting a JSON string to avoid errorneous diffs.
-	p, err := verify.SecondJSONUnlessEquivalent(d.Get("policy").(string), aws.ToString(out.Policy))
+	d.Set("kms_arn", out.KmsArn)
 
-	if err != nil {
-		return diag.Errorf("while setting policy (%s), encountered: %s", p, err)
+	if out.SourceFlowConfig != nil {
+		if err := d.Set("source_flow_config", []interface{}{flattenSourceFlowConfig(out.SourceFlowConfig)}); err != nil {
+			return fmt.Errorf("error setting source_flow_config: %w", err)
+		}
+	} else {
+		d.Set("source_flow_config", nil)
 	}
 
-	p, err = structure.NormalizeJsonString(p)
-
-	if err != nil {
-		return diag.Errorf("policy (%s) is invalid JSON: %s", p, err)
+	if err := d.Set("task", flattenTasks(out.Tasks)); err != nil {
+		return fmt.Errorf("error setting task: %w", err)
 	}
 
-	d.Set("policy", p)
+	if out.TriggerConfig != nil {
+		if err := d.Set("trigger_config", []interface{}{flattenTriggerConfig(out.TriggerConfig)}); err != nil {
+			return fmt.Errorf("error setting trigger_config: %w", err)
+		}
+	} else {
+		d.Set("trigger_config", nil)
+	}
 
 	// TIP: 5. Set the tags
 	//
@@ -1572,45 +1551,11 @@ func findFlowByID(ctx context.Context, conn *appflow.AppFlow, id string) (*appfl
 //
 // See more:
 // https://github.com/hashicorp/terraform-provider-aws/blob/main/docs/contributing/data-handling-and-conversion.md
-func flattenComplexArgument(apiObject *appflow.ComplexArgument) map[string]interface{} {
-	if apiObject == nil {
-		return nil
-	}
-
-	m := map[string]interface{}{}
-
-	if v := apiObject.SubFieldOne; v != nil {
-		m["sub_field_one"] = aws.ToString(v)
-	}
-
-	if v := apiObject.SubFieldTwo; v != nil {
-		m["sub_field_two"] = aws.ToString(v)
-	}
-
-	return m
-}
 
 // TIP: Often the AWS API will return a slice of structures in response to a
 // request for information. Sometimes you will have set criteria (e.g., the ID)
 // that means you'll get back a one-length slice. This plural function works
 // brilliantly for that situation too.
-func flattenComplexArguments(apiObjects []*appflow.ComplexArgument) []interface{} {
-	if len(apiObjects) == 0 {
-		return nil
-	}
-
-	var l []interface{}
-
-	for _, apiObject := range apiObjects {
-		if apiObject == nil {
-			continue
-		}
-
-		l = append(l, flattenComplexArgument(apiObject))
-	}
-
-	return l
-}
 
 // TIP: Remember, as mentioned above, expanders take a Terraform data structure
 // and return something that you can send to the AWS API. In other words,
@@ -2732,4 +2677,140 @@ func expandScheduledTriggerProperties(tfMap map[string]interface{}) *appflow.Sch
 	}
 
 	return a
+}
+
+func flattenDestinationFlowConfigs(destinationFlowConfigs []*appflow.DestinationFlowConfig) []interface{} {
+	if len(destinationFlowConfigs) == 0 {
+		return nil
+	}
+
+	var l []interface{}
+
+	for _, destinationFlowConfig := range destinationFlowConfigs {
+		if destinationFlowConfig == nil {
+			continue
+		}
+
+		l = append(l, flattenDestinationFlowConfig(DestinationFlowConfig))
+	}
+
+	return l
+}
+
+func flattenDestinationFlowConfig(destinationFlowConfig *appflow.DestinationFlowConfig) map[string]interface{} {
+	if destinationFlowConfig == nil {
+		return nil
+	}
+
+	m := map[string]interface{}{}
+
+	if v := destinationFlowConfig.ApiVersion; v != nil {
+		m["api_version"] = aws.ToString(v)
+	}
+
+	if v := destinationFlowConfig.ConnectorProfileName; v != nil {
+		m["connector_profile_name"] = aws.ToString(v)
+	}
+
+	if v := destinationFlowConfig.ConnectorType; v != nil {
+		m["connector_type"] = aws.ToString(v)
+	}
+
+	if v := destinationFlowConfig.DestinationConnectorProperties; v != nil {
+		m["destination_connector_properties"] = []interface{}{flattenDestinationConnectorProperties(v)}
+	}
+
+	return m
+}
+
+func flattenDestinationConnectorProperties(destinationConnectorProperties *appflow.DestinationConnectorProperties) map[string]interface{} {
+	if destinationConnectorProperties == nil {
+		return nil
+	}
+
+	m := map[string]interface{}{}
+
+	if v := destinationConnectorProperties.CustomConnector; v != nil {
+		m["custom_connector"] = []interface{}{flattenCustomConnectorDestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.CustomerProfiles; v != nil {
+		m["customer_profiles"] = []interface{}{flattenCustomerProfilesDestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.EventBridge; v != nil {
+		m["event_bridge"] = []interface{}{flattenEventBridgeDestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.Honeycode; v != nil {
+		m["honeycode"] = []interface{}{flattenHoneycodeDestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.LookoutMetrics; v != nil {
+		m["lookout_metrics"] = v[0].(appflow.LookoutMetricsDestinationProperties)
+	}
+
+	if v := destinationConnectorProperties.Marketo; v != nil {
+		m["marketo"] = []interface{}{flattenMarketoDestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.Redshift; v != nil {
+		m["redshift"] = []interface{}{flattenRedshiftDestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.S3; v != nil {
+		m["s3"] = []interface{}{flattenS3DestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.Salesforce; v != nil {
+		m["salesforce"] = []interface{}{flattenSalesforceDestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.SAPOData; v != nil {
+		m["sapo_data"] = []interface{}{flattenSAPODataDestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.Snowflake; v != nil {
+		m["snowflake"] = []interface{}{flattenSnowflakeDestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.Upsolver; v != nil {
+		m["upsolver"] = []interface{}{flattenUpsolverDestinationProperties(v)}
+	}
+
+	if v := destinationConnectorProperties.Zendesk; v != nil {
+		m["custom_connector"] = []interface{}{flattenCustomConnectorDestinationProperties(v)}
+	}
+
+	return m
+}
+
+func flattenCustomConnectorDestinationProperties(customConnector *appflow.CustomConnectorDestinationProperties) map[string]interface{} {
+	if customConnector == nil {
+		return nil
+	}
+
+	m := map[string]interface{}{}
+
+	if v := customConnector.CustomProperties; v != nil {
+		m["custom_properties"] = aws.StringValueMap(v)
+	}
+
+	if v := customConnector.EntityName; v != nil {
+		m["entity_name"] = aws.ToString(v)
+	}
+
+	if v := customConnector.ErrorHandlingConfig; v != nil {
+		m["error_handling_config"] = []interface{}{flattenErrorHandlingConfig(v)}
+	}
+
+	if v := customConnector.IdFieldNames; v != nil {
+		m["id_field_names"] = aws.StringValueSlice(v)
+	}
+
+	if v := customConnector.WriteOperationType; v != nil {
+		m["write_operation_type"] = aws.ToString(v)
+	}
+
+	return m
 }
